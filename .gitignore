@@ -1,0 +1,10 @@
+.env
+.venv/
+.vscode/
+__pycache__/
+*.py[cod]
+
+# Abaikan database SQLite
+*.sqlite
+*.sqlite3
+*.db
