@@ -206,13 +206,13 @@ riwayat lengkap tetap utuh di checkpointer.
 pytest
 ```
 
-52 test, tanpa perlu API key.
+53 test, tanpa perlu API key.
 
 | File | Mencakup |
 | --- | --- |
 | `test_profile_preferences.py` | Deteksi preferensi permanen vs instruksi sementara. |
 | `test_tools.py` | Kalkulator menolak kode arbitrer, file kredensial terblokir, path traversal terblokir. |
-| `test_router_eval.py` | Akurasi router pada dataset DEV dan HELDOUT. |
+| `test_router_eval.py` | Akurasi router pada dataset DEV dan HELDOUT, plus smoke test node router di aplikasi. |
 
 `test_router_eval.py` memuat model embedding sehingga butuh ±2 menit pada run
 pertama. Untuk melewatinya saat sedang cepat-cepat:
