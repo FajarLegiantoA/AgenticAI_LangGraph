@@ -166,7 +166,11 @@ Karena itu:
 * `read_project_file` menolak `.env`, `credentials.json`, `*.key/pem/p12/pfx`,
   dan direktori `.git`/`.venv`. Tanpa ini, satu suntikan prompt bisa membuat
   API key ikut terkirim ke provider.
-* Path traversal diblokir dengan resolve + `relative_to` root proyek.
+* Path traversal diblokir dengan resolve + `relative_to` root proyek. Pemisah
+  path dinormalisasi dulu dan path absolut (termasuk drive letter Windows)
+  ditolak sebelum operasi filesystem, supaya perilakunya identik di Windows dan
+  Linux. Di POSIX, `C:\Windows\win.ini` adalah satu nama file yang sah, jadi
+  tanpa normalisasi path itu lolos dan hanya gagal sebagai *file not found*.
 
 ---
 
@@ -221,7 +225,7 @@ benar aman bisa lebih pendek dari angkanya. Perilaku ini dikunci oleh
 pytest
 ```
 
-76 test, semuanya offline: tidak ada satu pun yang memanggil API.
+81 test, semuanya offline: tidak ada satu pun yang memanggil API.
 [`conftest.py`](conftest.py) menanam API key dummy sebelum modul proyek
 diimpor, jadi test berjalan tanpa `.env` yang benar dan tanpa biaya API.
 

@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import ast
 import operator
+import re
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from langchain_core.tools import tool
 
@@ -169,6 +170,41 @@ def current_datetime() -> str:
     return result
 
 
+def _normalize_relative(relative_path: str) -> str:
+    """Seragamkan pemisah path supaya input bergaya Windows tidak lolos di POSIX.
+
+    Di Linux, ``C:\\Windows\\win.ini`` adalah **satu nama file** yang sah karena
+    backslash bukan pemisah path. Tanpa normalisasi, pemeriksaan "di dalam
+    proyek" akan lolos dan path semacam itu hanya gagal sebagai *file not
+    found* — aman secara kebetulan, bukan karena ditolak.
+    """
+    return relative_path.strip().replace("\\", "/")
+
+
+def _is_absolute(relative_path: str) -> bool:
+    """True untuk path absolut atau yang mengandung drive letter Windows."""
+    normalized = _normalize_relative(relative_path)
+
+    if PurePosixPath(normalized).is_absolute():
+        return True
+
+    # "C:/..." tidak dianggap absolut oleh PurePosixPath, tapi jelas bukan
+    # path relatif terhadap proyek.
+    return bool(re.match(r"^[A-Za-z]:/", normalized))
+
+
+def _resolve_project_path(relative_path: str) -> Path | None:
+    """Gabungkan input dengan root proyek, atau ``None`` kalau harus ditolak.
+
+    Penolakan terjadi sebelum operasi filesystem apa pun, jadi hasilnya sama
+    di Windows maupun Linux.
+    """
+    if _is_absolute(relative_path):
+        return None
+
+    return (PROJECT_ROOT / _normalize_relative(relative_path)).resolve()
+
+
 def _is_within(root: Path, candidate: Path) -> bool:
     """Cegah path keluar dari proyek lewat ``..`` atau symlink."""
     try:
@@ -197,9 +233,9 @@ def read_project_file(relative_path: str) -> str:
     "router.py". Use this to inspect the user's own code instead of guessing
     what a file contains. Credential files such as .env cannot be read.
     """
-    candidate = (PROJECT_ROOT / relative_path).resolve()
+    candidate = _resolve_project_path(relative_path)
 
-    if not _is_within(PROJECT_ROOT, candidate):
+    if candidate is None or not _is_within(PROJECT_ROOT, candidate):
         return "Error: path is outside the project directory."
 
     if _is_blocked(candidate):
@@ -231,9 +267,9 @@ def list_project_files(subdirectory: str = ".") -> str:
     Use this before read_project_file when the file name is unknown. The
     argument is a folder relative to the project root; "." means the root.
     """
-    candidate = (PROJECT_ROOT / subdirectory).resolve()
+    candidate = _resolve_project_path(subdirectory)
 
-    if not _is_within(PROJECT_ROOT, candidate):
+    if candidate is None or not _is_within(PROJECT_ROOT, candidate):
         return "Error: path is outside the project directory."
 
     if not candidate.is_dir():

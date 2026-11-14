@@ -10,7 +10,10 @@ from __future__ import annotations
 import pytest
 
 from tools import (
+    PROJECT_ROOT,
     TOOLS,
+    _is_within,
+    _resolve_project_path,
     evaluate_expression,
     list_project_files,
     read_project_file,
@@ -104,10 +107,60 @@ def test_read_project_file_blocks_sensitive_paths(path):
         "../../../etc/passwd",
         "..\\..\\Windows\\win.ini",
         "C:\\Windows\\win.ini",
+        "/etc/passwd",
+        "..",
     ],
 )
 def test_read_project_file_blocks_path_traversal(path):
     result = read_project_file.invoke({"relative_path": path})
+
+    assert "outside" in result.lower() or "not allowed" in result.lower(), result
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "..\\..\\Windows\\win.ini",
+        "C:\\Windows\\win.ini",
+        "C:/Windows/win.ini",
+        "/etc/passwd",
+    ],
+)
+def test_windows_and_absolute_paths_are_rejected_on_every_os(path):
+    """Perilaku harus sama di Windows dan Linux.
+
+    Di POSIX, backslash bukan pemisah path, jadi ``C:\\Windows\\win.ini``
+    adalah satu nama file yang secara teknis masih "di dalam" proyek. CI Linux
+    pernah menangkap ini: path tersebut lolos pemeriksaan dan hanya gagal
+    sebagai *file not found*. Sekarang pemisah dinormalisasi dan path absolut
+    ditolak sebelum operasi filesystem apa pun.
+    """
+    resolved = _resolve_project_path(path)
+
+    assert resolved is None or not _is_within(PROJECT_ROOT, resolved)
+
+    result = read_project_file.invoke({"relative_path": path})
+
+    assert "outside" in result.lower(), result
+
+
+def test_ordinary_relative_paths_still_resolve():
+    resolved = _resolve_project_path("app.py")
+
+    assert resolved is not None
+    assert resolved.name == "app.py"
+    assert _is_within(PROJECT_ROOT, resolved)
+
+
+def test_nested_relative_path_resolves():
+    resolved = _resolve_project_path(".github/workflows/ci.yml")
+
+    assert resolved is not None
+    assert _is_within(PROJECT_ROOT, resolved)
+
+
+def test_list_project_files_blocks_traversal():
+    result = list_project_files.invoke({"subdirectory": "../"})
 
     assert "outside" in result.lower() or "not allowed" in result.lower()
 
@@ -119,10 +172,10 @@ def test_list_project_files_returns_names():
     assert ".venv" not in listing
 
 
-def test_list_project_files_blocks_traversal():
-    result = list_project_files.invoke({"subdirectory": "../"})
+def test_list_project_files_blocks_windows_absolute_path():
+    result = list_project_files.invoke({"subdirectory": "C:\\Windows"})
 
-    assert "outside" in result.lower() or "not allowed" in result.lower()
+    assert "outside" in result.lower(), result
 
 
 # ---------------------------------------------------------------------------
