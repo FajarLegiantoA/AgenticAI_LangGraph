@@ -1,72 +1,64 @@
+"""Aplikasi LangGraph dengan pemanggilan tool.
+
+Graph-nya berbentuk loop: model menjawab, dan kalau ia meminta tool,
+``ToolNode`` menjalankannya lalu hasilnya dikembalikan ke model.
+
+Jalankan dengan::
+
+    python app_tools.py
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
 
 from langchain_core.messages import HumanMessage
-from langchain_core.tools import tool
-
-from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 
-# Use the model client that you have successfully tested.
-from app import llm
+from llm import get_llm
+from log import get_logger
+from tools import TOOLS
+
+logger = get_logger(__name__)
 
 
-# 1. Create a multiplication tool
-@tool
-def multiply(a: int, b: int) -> int:
-    """Multiply two integers. Use this to calculate a times b."""
-    result = a * b
-    print(f"[Tool] multiply({a}, {b}) = {result}")
-    return result
+@lru_cache(maxsize=1)
+def get_llm_with_tools():
+    """Model + tool dibuat saat pertama dipakai, bukan saat modul diimpor.
+
+    Model harus mendukung tool/function calling untuk provider yang dipilih.
+    """
+    return get_llm().bind_tools(TOOLS)
 
 
-# 2. Create an addition tool
-@tool
-def add(a: int, b: int) -> int:
-    """Add two integers."""
-    result = a + b
-    print(f"[Tool] add({a}, {b}) = {result}")
-    return result
-
-
-# 3. Register all tools the model is allowed to use
-tools = [multiply, add]
-
-# Bind the list of tools to the model.
-# The model must support tool/function calling.
-llm_with_tools = llm.bind_tools(tools)
-
-
-# 4. Define the node to call the model
 def call_model(state: MessagesState):
-    response = llm_with_tools.invoke(state["messages"])
+    response = get_llm_with_tools().invoke(state["messages"])
 
-    # MessagesState will append the new response message
-    # to the existing messages.
+    # MessagesState otomatis menambahkan pesan baru ke riwayat.
     return {"messages": [response]}
 
 
-# 5. Build the graph
 builder = StateGraph(MessagesState)
 
 builder.add_node("llm", call_model)
-builder.add_node("tools", ToolNode(tools))
+builder.add_node("tools", ToolNode(TOOLS))
 
 builder.add_edge(START, "llm")
 
-# Jika model meminta tool, jalankan ToolNode.
-# Jika tidak, akhiri graph.
+# Kalau model meminta tool, jalankan ToolNode; kalau tidak, akhiri graph.
 builder.add_conditional_edges("llm", tools_condition)
 
-# After the tool finishes, the model receives the output
-# and can generate the final answer.
+# Setelah tool selesai, model menerima hasilnya dan menyusun jawaban akhir.
 builder.add_edge("tools", "llm")
 
 graph = builder.compile()
 
 
-# 6. Run the application via the terminal
 def main():
     print("=== LangGraph Tool Calling ===")
-    print("Available tools: multiply, add")
+    print("Available tools:", ", ".join(tool.name for tool in TOOLS))
+    print("Try: 'what is 23 * 7?' or 'list files in the current directory'")
     print("Type 'exit' to quit.\n")
 
     while True:
@@ -84,13 +76,17 @@ def main():
                 "messages": [HumanMessage(content=question)]
             })
 
-            final_message = result["messages"][-1]
-            print(f"\nAI: {final_message.content}\n")
+            # Tampilkan tool yang sebenarnya dipanggil supaya terlihat alurnya.
+            for message in result["messages"][1:]:
+                for call in getattr(message, "tool_calls", None) or []:
+                    print(f"[Tool call] {call['name']}{call['args']}")
+
+            print(f"\nAI: {result['messages'][-1].content}\n")
 
         except Exception as exc:
+            logger.exception("graph invocation failed")
             print(f"\nAn error occurred: {exc}\n")
 
 
 if __name__ == "__main__":
     main()
-    

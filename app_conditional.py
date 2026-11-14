@@ -1,170 +1,148 @@
-from typing import Literal, TypedDict
+"""Aplikasi LangGraph dengan conditional edge (routing).
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langgraph.graph import END, START, StateGraph
+Ini versi paling sederhana dari routing: satu node pemilih rute, dua node
+tujuan. Rute dihitung oleh modul :mod:`router` (embedding + nearest
+neighbour), bukan oleh LLM, jadi murah, cepat, dan bisa diuji.
 
-# Use the model client that was successfully configured
-# in our first application.
-from app import llm
+Jalankan dengan::
 
+    python app_conditional.py
+"""
 
-# 1. Inisialisasi Model Embedding Qwen3 via Hugging Face
-print("Loading Qwen3 Embedding Model...")
-embeddings = HuggingFaceEmbeddings(
-    model_name="Qwen/Qwen3-Embedding-0.6B",
-    model_kwargs={"device": "cpu"},  # Ubah ke 'cuda' jika menggunakan GPU Nvidia
-    encode_kwargs={"normalize_embeddings": True},
-)
+from __future__ import annotations
 
-# 2. Definisikan Prototipe Pertanyaan untuk Setiap Rute
-routing_samples = [
-    # Samples for Coding / SQL
-    Document(page_content="Write a SQL query with SELECT, JOIN, or GROUP BY", metadata={"route": "coding"}),
-    Document(page_content="How do I filter and aggregate database tables in Postgres or MySQL?", metadata={"route": "coding"}),
-    Document(page_content="Debug code, fix syntax errors, and resolve exceptions", metadata={"route": "coding"}),
-    Document(page_content="Write a Python or JavaScript function, algorithm, or script", metadata={"route": "coding"}),
-    Document(page_content="How do I connect to a relational database using an ORM?", metadata={"route": "coding"}),
+from functools import lru_cache
+from typing import Literal
 
-    # Samples for AI / ML
-    Document(page_content="Explain deep learning architecture, transformers, or neural networks", metadata={"route": "ml"}),
-    Document(page_content="How does Retrieval-Augmented Generation (RAG) and vector embedding work?", metadata={"route": "ml"}),
-    Document(page_content="Fine-tune Large Language Models (LLM) and train machine learning models", metadata={"route": "ml"}),
-    Document(page_content="Backpropagation, loss functions, and gradient descent optimization", metadata={"route": "ml"}),
-    Document(page_content="Difference between supervised learning, unsupervised learning, and reinforcement learning", metadata={"route": "ml"}),
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, MessagesState, StateGraph
 
-    # Samples for General Tech / Explanations
-    Document(page_content="Explain how the internet, DNS, and IP addresses work to a beginner", metadata={"route": "general"}),
-    Document(page_content="What is cloud computing, virtualization, and how does the web function?", metadata={"route": "general"}),
-    Document(page_content="History of computer hardware, CPUs, and operating systems", metadata={"route": "general"}),
-    Document(page_content="General tips for productivity and basic computer usage", metadata={"route": "general"}),
-]
+from llm import get_llm
+from log import get_logger
+from router import RouteDecision, routing_sample_count, semantic_route
 
-# 3. Buat Vector Store Chroma di dalam Memori
-vector_store = Chroma.from_documents(
-    documents=routing_samples,
-    embedding=embeddings,
-    collection_name="intent_router",
-)
+logger = get_logger(__name__)
+
+# Tipe state tambahan: rute terpilih disimpan supaya bisa dibaca node lain.
+RouteType = Literal["general", "coding"]
 
 
-# 1. Define graph state
-class GraphState(TypedDict):
-    question: str
-    route: str
-    answer: str
+@lru_cache(maxsize=1)
+def get_chat_model():
+    """Model dibuat saat pertama dipakai, bukan saat modul diimpor."""
+    return get_llm()
 
 
-# 2. Node to classify the question category
-def classify_question(state: GraphState) -> dict:
-    query = state["question"]
-
-    # Cari 1 dokumen prototipe yang paling mirip secara makna/semantik
-    results = vector_store.similarity_search(query, k=1)
-
-    if results:
-        route = results[0].metadata.get("route", "general")
-        matched_sample = results[0].page_content
-    else:
-        route = "general"
-        matched_sample = "None"
-
-    print(f"\n[Semantic Router] Question : '{query}'")
-    print(f"[Semantic Router] Matched  : '{matched_sample}'")
-    print(f"[Semantic Router] Target   : {route}\n")
-
-    return {"route": route}
+class RoutingState(MessagesState):
+    route: RouteType
 
 
-# 3. Node specifically for coding and SQL questions
-def coding_node(state: GraphState) -> dict:
-    response = llm.invoke(
-        [
-            (
-                "system",
-                "You are a senior software engineer and database engineer. "
-                "Answer coding and SQL queries with efficient code/SQL examples "
-                "and concise explanations in English.",
-            ),
-            ("human", state["question"]),
-        ]
+def route_node(state: RoutingState):
+    """Memilih rute berdasarkan pertanyaan user."""
+    question = state["messages"][-1].content
+    decision = semantic_route(str(question))
+
+    logger.debug(
+        "route=%s distance=%.4f rescued=%s neighbors=%s matched=%r",
+        decision.route,
+        decision.distance,
+        decision.rescued,
+        decision.neighbors,
+        decision.matched_sample,
     )
 
-    return {"answer": str(response.content)}
+    return {"route": decision.route}
 
 
-# 4. Node specifically for AI / Machine Learning questions
-def ml_node(state: GraphState) -> dict:
-    response = llm.invoke(
-        [
-            (
-                "system",
-                "You are an AI/ML research scientist and engineer. "
-                "Explain Machine Learning, Neural Networks, LLMs, and AI concepts "
-                "clearly with practical insights or code snippets in English.",
-            ),
-            ("human", state["question"]),
-        ]
-    )
+def call_general(state: RoutingState):
+    messages = [
+        SystemMessage(content="You are a helpful general assistant."),
+        *state["messages"],
+    ]
 
-    return {"answer": str(response.content)}
+    response = get_chat_model().invoke(messages)
+
+    return {"messages": [response]}
 
 
-# 4. Node specifically for general questions
-def general_node(state: GraphState) -> dict:
-    response = llm.invoke(
-        [
-            (
-                "system",
-                "You are an AI assistant who explains general technology "
-                "concepts in simple, clear, and beginner-friendly English.",
-            ),
-            ("human", state["question"]),
-        ]
-    )
+def call_coding(state: RoutingState):
+    messages = [
+        SystemMessage(
+            content=(
+                "You are an expert Python and LangGraph developer. "
+                "Provide clean, working code examples with explanations."
+            )
+        ),
+        *state["messages"],
+    ]
 
-    return {"answer": str(response.content)}
+    response = get_chat_model().invoke(messages)
 
-
-# 5. Function to select the execution route
-def choose_route(
-    state: GraphState,
-) -> Literal["coding", "ml", "general"]:
-    return state["route"]
+    return {"messages": [response]}
 
 
-# 6. Assemble the graph
-builder = StateGraph(GraphState)
+def route_after_classifier(
+    state: RoutingState,
+) -> Literal["general_agent", "coding_agent"]:
+    """Function yang menentukan node tujuan berikutnya.
 
-builder.add_node("classify", classify_question)
-builder.add_node("coding_node", coding_node)
-builder.add_node("ml_node", ml_node)
-builder.add_node("general_node", general_node)
+    Conditional edge menerima state lalu mengembalikan nama node tujuan.
+    """
+    return "general_agent" if state["route"] == "general" else "coding_agent"
 
-builder.add_edge(START, "classify")
 
+builder = StateGraph(RoutingState)
+
+builder.add_node("router", route_node)
+builder.add_node("general_agent", call_general)
+builder.add_node("coding_agent", call_coding)
+
+builder.add_edge(START, "router")
+
+# Router memilih salah satu dari dua agent.
 builder.add_conditional_edges(
-    "classify",
-    choose_route,
+    "router",
+    route_after_classifier,
     {
-        "coding": "coding_node",
-        "ml": "ml_node",
-        "general": "general_node",
+        "general_agent": "general_agent",
+        "coding_agent": "coding_agent",
     },
 )
 
-builder.add_edge("coding_node", END)
-builder.add_edge("ml_node", END)
-builder.add_edge("general_node", END)
+builder.add_edge("general_agent", END)
+builder.add_edge("coding_agent", END)
 
 graph = builder.compile()
 
 
-# 7. Run the terminal application
+def show_routing_info(question: str) -> RouteDecision:
+    """Tampilkan hasil routing sebelum graph dijalankan."""
+    decision = semantic_route(question)
+
+    print(f"\nRouting: {decision.route}")
+    print(f"  distance = {decision.distance:.4f}")
+    print(f"  rescued  = {decision.rescued}")
+    print(f"  neighbors= {decision.neighbors}")
+
+    if decision.matched_sample != "None":
+        print(f"  closest  = {decision.matched_sample!r}")
+
+    return decision
+
+
 def main():
-    print("=== LangGraph Conditional Routing ===")
-    print("Type 'exit' or 'quit' to end.\n")
+    print("=== LangGraph Conditional Edge (semantic routing) ===")
+
+    # Diagram dicetak di dalam main(), bukan di level modul, supaya
+    # mengimpor modul ini untuk testing tidak ikut membangun diagram.
+    print(graph.get_graph().draw_mermaid())
+
+    # Bangun vector store sekali di awal supaya waktu routing tidak
+    # tercampur dengan waktu pemrosesan pertanyaan.
+    print(f"Routing samples loaded: {routing_sample_count()}")
+
+    print("Type a question to see it routed to general_agent or coding_agent.")
+    print("Type 'exit' to quit.\n")
 
     while True:
         question = input("You: ").strip()
@@ -177,21 +155,22 @@ def main():
             continue
 
         try:
-            result = graph.invoke(
-                {
-                    "question": question,
-                    "route": "",
-                    "answer": "",
-                }
-            )
+            show_routing_info(question)
 
-            print(f"\nRoute : {result['route']}")
-            print(f"AI    : {result['answer']}\n")
+            result = graph.invoke({
+                "messages": [HumanMessage(content=question)]
+            })
+
+            # Pesan terakhir adalah jawaban agent, pesan sebelumnya adalah
+            # hasil dari node router (kalau ada).
+            answer = result["messages"][-1]
+
+            print(f"\nAI: {answer.content}\n")
 
         except Exception as exc:
+            logger.exception("graph invocation failed")
             print(f"\nAn error occurred: {exc}\n")
 
-print(graph.get_graph().draw_mermaid())
 
 if __name__ == "__main__":
     main()

@@ -1,13 +1,16 @@
 from openai import OpenAI
-from app import api_key, provider, model_name
+
+from config import get_llm_settings
+
+settings = get_llm_settings()
 
 client = OpenAI(
-    api_key=api_key,
-    base_url=provider["base_url"],
+    api_key=settings.api_key,
+    base_url=settings.base_url,
 )
 
 response = client.chat.completions.create(
-    model=model_name,
+    model=settings.model_name,
     messages=[
         {"role": "user", "content": "My name is Alex. Reply briefly."}
     ],
@@ -17,8 +20,8 @@ response = client.chat.completions.create(
 message = response.choices[0].message
 raw_message = message.model_dump()
 
-print("Provider:", provider["base_url"])
-print("Model:", model_name)
+print("Provider:", settings.base_url)
+print("Model:", settings.model_name)
 
 print("Response fields:", list(raw_message.keys()))
 

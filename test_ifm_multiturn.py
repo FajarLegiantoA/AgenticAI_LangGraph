@@ -1,10 +1,13 @@
 
 from openai import OpenAI
-from app import api_key, provider, model_name
+
+from config import get_llm_settings
+
+settings = get_llm_settings()
 
 client = OpenAI(
-    api_key=api_key,
-    base_url=provider["base_url"],
+    api_key=settings.api_key,
+    base_url=settings.base_url,
 )
 
 messages = [
@@ -17,7 +20,7 @@ messages = [
 try:
     # Turn 1
     response1 = client.chat.completions.create(
-        model=model_name,
+        model=settings.model_name,
         messages=messages,
         max_tokens=100,
     )
@@ -42,7 +45,7 @@ try:
 
     # Turn 2
     response2 = client.chat.completions.create(
-        model=model_name,
+        model=settings.model_name,
         messages=messages,
         max_tokens=100,
     )

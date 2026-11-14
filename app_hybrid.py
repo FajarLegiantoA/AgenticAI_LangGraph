@@ -1,419 +1,458 @@
+"""Aplikasi LangGraph hybrid: conditional routing + tool calling.
 
-import re
+Menggabungkan conditional edges dan tool calling dalam satu graph::
 
-from typing import TypedDict
+    START -> router -> llm -> [tools -> llm] -> END
 
-from dotenv import load_dotenv
-from langchain_core.documents import Document
+Semua komponen berat dipisah ke modul sendiri (:mod:`router`, :mod:`tools`,
+:mod:`llm`, :mod:`config`, :mod:`log`), jadi file ini terutama berisi
+perakitan graph dan loop CLI-nya.
+
+Fitur tambahan dibanding ``app_conditional.py``:
+
+* tool calling dengan loop ``llm -> tools -> llm``
+* long-term memory profil user (:mod:`profile_memory`)
+* riwayat percakapan per sesi lewat ``SqliteSaver``
+* streaming token ke terminal
+* pemotongan konteks otomatis sebelum memanggil model
+
+Jalankan dengan::
+
+    python app_hybrid.py
+"""
+
+from __future__ import annotations
+
+import uuid
+from functools import lru_cache
+from typing import Literal
+
 from langchain_core.messages import (
-    AIMessage,
+    AIMessageChunk,
+    AnyMessage,
     HumanMessage,
     SystemMessage,
+    ToolMessage,
 )
-from langchain_core.tools import tool
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from langgraph.graph import StateGraph, MessagesState, START
-from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.messages.utils import (
+    count_tokens_approximately,
+    trim_messages,
+)
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import MessagesState
+from langgraph.prebuilt import ToolNode
 
-# Gunakan model client yang sudah berhasil kamu uji.
-from app import llm
+import profile_memory
+from llm import get_llm
+from log import get_logger
+from router import routing_sample_count, semantic_route
+from tools import TOOLS
 
-from profile_memory import (
-    init_profile_db,
-    get_profile,
-    update_profile_name,
-)
-
-load_dotenv()
-
-
-# =========================================================
-# 1. SEMANTIC ROUTING: QWEN3 + CHROMA
-# =========================================================
-
-print("Loading Qwen3 Embedding Model...")
-
-embeddings = HuggingFaceEmbeddings(
-    model_name="Qwen/Qwen3-Embedding-0.6B",
-    model_kwargs={"device": "cpu"},
-    encode_kwargs={"normalize_embeddings": True},
-)
+logger = get_logger(__name__)
 
 
-routing_samples = [
-    # Coding / SQL
-    Document(
-        page_content="Write SQL queries using SELECT, JOIN, GROUP BY, "
-                     "ORDER BY, and database aggregation.",
-        metadata={"route": "coding"},
-    ),
-    Document(
-        page_content="Find the five highest paid employees using SQL "
-                     "queries in PostgreSQL or MySQL.",
-        metadata={"route": "coding"},
-    ),
-    Document(
-        page_content="How do I filter and aggregate database tables "
-                     "in Postgres or MySQL?",
-        metadata={"route": "coding"},
-    ),
-    Document(
-        page_content="Debug Python code, fix syntax errors, and "
-                     "write functions or algorithms.",
-        metadata={"route": "coding"},
-    ),
-    Document(
-        page_content="Write JavaScript code, scripts, and software "
-                     "applications.",
-        metadata={"route": "coding"},
-    ),
-    Document(
-        page_content="How do I connect to a relational database using "
-                     "an ORM?",
-        metadata={"route": "coding"}
-    ),
+@lru_cache(maxsize=1)
+def get_llm_with_tools():
+    """Model yang sudah di-bind tool, dibuat sekali saat pertama dipakai.
 
-    # AI / ML
-    Document(
-        page_content="Explain machine learning, neural networks, "
-                     "deep learning, and model training.",
-        metadata={"route": "ml"},
-    ),
-    Document(
-        page_content="Explain transformer architecture, attention, "
-                     "LLMs, and tokenization.",
-        metadata={"route": "ml"},
-    ),
-    Document(
-        page_content="Explain RAG, vector embeddings, vector databases, "
-                     "and semantic search.",
-        metadata={"route": "ml"},
-    ),
-    Document(
-        page_content="How does Retrieval-Augmented Generation (RAG) and "
-        "vector embedding work?",
-        metadata={"route": "ml"}
-    ),
-    Document(
-        page_content="Explain gradient descent, loss functions, "
-                     "backpropagation, and fine-tuning.",
-        metadata={"route": "ml"},
-    ),
-    Document(
-        page_content="Difference between supervised learning, unsupervised "
-                     "learning, and reinforcement learning",
-        metadata={"route": "ml"}
-    ),
+    Sengaja tidak dibuat di level modul: mengimpor modul ini (misalnya dari
+    test) tidak boleh menuntut API key sudah terisi.
+    """
+    return get_llm().bind_tools(TOOLS)
 
-    # General technology
-    Document(
-        page_content="Explain how the internet, DNS, IP addresses, "
-                     "and computer networks work for beginners.",
-        metadata={"route": "general"},
-    ),
-    Document(
-        page_content="Explain cloud computing, operating systems, "
-                     "virtualization, and computer hardware.",
-        metadata={"route": "general"},
-    ),
-    Document(
-        page_content="Explain general technology concepts in simple "
-                     "language for non-technical users.",
-        metadata={"route": "general"},
-    ),
-    Document(
-        page_content="Explain how websites, web browsers, and HTTP "
-                     "work in everyday life.",
-        metadata={"route": "general"},
-    ),
-    Document(
-        page_content="History of computer hardware, CPUs, and operating "
-                     "systems",
-        metadata={"route": "general"}
-    )
-]
+# Batas konteks yang dikirim ke model. Ini hanya membatasi apa yang dilihat
+# model; riwayat lengkap tetap tersimpan di checkpointer.
+MAX_CONTEXT_TOKENS = 2048
+MAX_RECENT_MESSAGES = 12
 
-print("Building routing vector store...")
+# user_id mengidentifikasi orang (long-term memory, lintas sesi).
+# thread_id mengidentifikasi satu percakapan (short-term memory).
+DEFAULT_USER_ID = "local-user"
 
-vector_store = Chroma.from_documents(
-    documents=routing_samples,
-    embedding=embeddings,
-    collection_name="hybrid_intent_router",
-)
+CHECKPOINT_DB = "checkpoints.sqlite"
 
 
-def semantic_route(question: str) -> tuple[str, float]:
-    """Pilih route berdasarkan contoh dengan jarak embedding terdekat."""
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
-    matches = vector_store.similarity_search_with_score(
-        question,
-        k=3,
-    )
+RouteType = Literal["general", "coding", "ml"]
 
-    if not matches:
-        return "general", float("inf")
-
-    # Pada Chroma, score dari similarity_search_with_score
-    # umumnya merupakan jarak: semakin kecil, semakin dekat.
-    best_document, best_distance = matches[0]
-
-    route = best_document.metadata.get("route", "general")
-
-    print(f"\n[Router] Best route : {route}")
-    print(f"[Router] Distance  : {best_distance:.4f}")
-
-    print("[Router] Top matches:")
-    for document, distance in matches:
-        print(
-            f"  - {document.metadata.get('route')} "
-            f"| distance={distance:.4f} "
-            f"| {document.page_content[:75]}"
-        )
-
-    return route, float(best_distance)
-
-
-# =========================================================
-# 2. TOOLS
-# =========================================================
-
-# 1. Create a multiplication tool
-@tool
-def multiply(a: int, b: int) -> int:
-    """Multiply two integers. Use this to calculate a times b."""
-    result = a * b
-    print(f"\n[Tool] multiply({a}, {b}) = {result}")
-    return result
-
-
-# 2. Create an addition tool
-@tool
-def add(a: int, b: int) -> int:
-    """Add two integers."""
-    result = a + b
-    print(f"\n[Tool] add({a}, {b}) = {result}")
-    return result
-
-# 3. Register all tools the model is allowed to use
-tools = [multiply, add]
-
-# Bind the list of tools to the model.
-# The model must support tool/function calling.
-llm_with_tools = llm.bind_tools(tools)
-
-
-# =========================================================
-# 3. GRAPH STATE
-# =========================================================
 
 class AgentState(MessagesState):
-    route: str
+    """State dengan informasi rute hasil klasifikasi semantik."""
+
+    route: RouteType
     route_distance: float
 
 
-# =========================================================
-# 4. SEMANTIC ROUTER NODE
-# =========================================================
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
 
-def router_node(state: AgentState) -> dict:
-    question = next(
-        message.content
-        for message in reversed(state["messages"])
-        if isinstance(message, HumanMessage)
-    )
-
-    route, distance = semantic_route(str(question))
-
-    return {
-        "route": route,
-        "route_distance": distance,
-    }
-
-
-# =========================================================
-# 5. LLM NODE
-# =========================================================
-
-SYSTEM_PROMPTS = {
+# Base prompt per rute. Prompt profil ditambahkan di atasnya.
+SYSTEM_PROMPTS: dict[RouteType, str] = {
+    "general": "You are a helpful general assistant.",
     "coding": (
-        "You are a senior software engineer and database engineer. "
-        "Answer coding and SQL questions accurately. "
-        "Use tools when they are genuinely helpful. "
-        "Respond in the language used by the user."
+        "You are an expert Python and LangGraph developer. "
+        "Provide clean, working code examples with explanations."
     ),
     "ml": (
-        "You are an AI and machine learning engineer and research scientist. "
-        "Explain embeddings, machine learning, neural networks, "
-        "and LLM concepts accurately. "
-        "Use tools when they are genuinely helpful. "
-        "Respond in the language used by the user."
-    ),
-    "general": (
-        "You are a helpful technology assistant. "
-        "Explain concepts clearly and adjust explanations "
-        "to the user's level. Use tools when genuinely helpful. "
-        "Respond in the language used by the user."
+        "You are a machine learning engineer. Explain concepts clearly "
+        "and provide practical code examples when relevant."
     ),
 }
 
 
-def call_model(state: AgentState) -> dict:
-    route = state.get("route", "general")
-    system_prompt = SYSTEM_PROMPTS.get(
-        route,
-        SYSTEM_PROMPTS["general"],
+def build_system_prompt(route: RouteType, user_id: str) -> str:
+    """Gabung prompt rute dengan profil long-term user yang tersimpan."""
+    parts = [SYSTEM_PROMPTS.get(route, SYSTEM_PROMPTS["general"])]
+
+    profile = profile_memory.get_profile(user_id)
+
+    if profile:
+        details = []
+
+        if profile.get("name"):
+            details.append(f"- User's name: {profile['name']}")
+
+        if profile.get("preferred_language"):
+            details.append(
+                f"- Preferred language: {profile['preferred_language']}"
+            )
+
+        if profile.get("response_style"):
+            details.append(f"- Response style: {profile['response_style']}")
+
+        if details:
+            parts.append(
+                "Long-term user profile:\n"
+                + "\n".join(details)
+                + "\nUse this profile when relevant."
+            )
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+def router_node(state: AgentState):
+    """Node pertama: tentukan rute dari pertanyaan user."""
+    question = state["messages"][-1].content
+    decision = semantic_route(str(question))
+
+    logger.debug(
+        "route=%s distance=%.4f rescued=%s neighbors=%s matched=%r",
+        decision.route,
+        decision.distance,
+        decision.rescued,
+        decision.neighbors,
+        decision.matched_sample,
     )
 
-    response = llm_with_tools.invoke(
-        [
-            SystemMessage(content=system_prompt),
-            *state["messages"],
-        ]
+    return {
+        "route": decision.route,
+        "route_distance": decision.distance,
+    }
+
+
+def build_model_messages(state: AgentState, user_id: str) -> list[AnyMessage]:
+    """Susun pesan untuk model: system prompt + riwayat yang dipotong.
+
+    Pemotongan hanya memengaruhi apa yang dikirim ke model. State graph
+    (dan dengan itu riwayat di checkpointer) tidak diubah, sehingga user
+    tetap bisa melihat percakapan penuh.
+    """
+    messages: list[AnyMessage] = list(state["messages"])
+
+    if not messages:
+        return []
+
+    # System prompt dibangun ulang setiap panggilan karena profil user bisa
+    # berubah di tengah sesi, dan karena prompt tidak boleh tersimpan di
+    # riwayat. Instruksi sementara hanya berlaku untuk giliran ini, jadi ia
+    # juga harus dihitung ulang, bukan disimpan di state.
+    system_prompt = build_system_prompt(
+        state.get("route", "general"),
+        user_id,
+    )
+
+    temporary = profile_memory.detect_temporary_instructions(
+        str(messages[-1].content)
+    )
+
+    if temporary:
+        overrides = ", ".join(f"{k}: {v}" for k, v in temporary.items())
+        system_prompt += f"\n\nFor this response only: {overrides}."
+
+    # strategy="last" menyimpan pesan-pesan terbaru. start_on="human"
+    # menjamin hasil potongan dimulai dari awal giliran user, sehingga tidak
+    # pernah menyisakan ToolMessage tanpa AIMessage tool_calls pendahulunya
+    # (kondisi yang ditolak API). end_on sengaja tidak dipakai: pesan terakhir
+    # justru HumanMessage baru yang akan dijawab.
+    trimmed = trim_messages(
+        messages,
+        max_tokens=MAX_CONTEXT_TOKENS,
+        token_counter=count_tokens_approximately,
+        strategy="last",
+        start_on="human",
+        allow_partial=False,
+    )
+
+    # Batas keras kedua: jumlah pesan, supaya percakapan pendek pun tidak
+    # pernah membawa seluruh riwayat.
+    trimmed = trimmed[-MAX_RECENT_MESSAGES:]
+
+    return [SystemMessage(content=system_prompt), *trimmed]
+
+
+def llm_node(state: AgentState, config: RunnableConfig):
+    """Node kedua: model menjawab, mungkin dengan meminta tool."""
+    user_id = config.get("configurable", {}).get("user_id", DEFAULT_USER_ID)
+
+    response = get_llm_with_tools().invoke(
+        build_model_messages(state, user_id)
     )
 
     return {"messages": [response]}
 
 
-# =========================================================
-# 6. BUILD LANGGRAPH
-# =========================================================
+def route_after_llm(state: AgentState) -> Literal["tools", "__end__"]:
+    """Kalau model meminta tool, jalankan tool; kalau tidak, selesai."""
+    last_message = state["messages"][-1]
 
-builder = StateGraph(AgentState)
+    if getattr(last_message, "tool_calls", None):
+        return "tools"
 
-builder.add_node("router", router_node)
-builder.add_node("llm", call_model)
-builder.add_node("tools", ToolNode(tools))
-
-builder.add_edge(START, "router")
-builder.add_edge("router", "llm")
-
-# Model memilih: panggil tool atau selesai.
-builder.add_conditional_edges("llm", tools_condition)
-
-# Setelah tool selesai, kembali ke model.
-builder.add_edge("tools", "llm")
+    return END
 
 
-# =========================================================
-# 7. INTERACTIVE CLI
-# =========================================================
+# ---------------------------------------------------------------------------
+# Graph
+# ---------------------------------------------------------------------------
+
+def build_graph(checkpointer=None):
+    """Bangun dan compile graph.
+
+    ``checkpointer`` sengaja berupa parameter, bukan dibuat di level modul,
+    supaya file ini bisa diimpor untuk testing tanpa membuka koneksi DB.
+    """
+    builder = StateGraph(AgentState)
+
+    builder.add_node("router", router_node)
+    builder.add_node("llm", llm_node)
+    builder.add_node("tools", ToolNode(TOOLS))
+
+    builder.add_edge(START, "router")
+    builder.add_edge("router", "llm")
+
+    # Conditional: tool loop atau selesai.
+    builder.add_conditional_edges(
+        "llm",
+        route_after_llm,
+        {"tools": "tools", END: END},
+    )
+
+    # Setelah tool dijalankan, kembali ke llm untuk jawaban akhir.
+    builder.add_edge("tools", "llm")
+
+    return builder.compile(checkpointer=checkpointer)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+SESSION_COMMANDS = {
+    "/new": "start a new conversation (new thread id)",
+    "/reset": "start a new conversation and forget stored preferences",
+    "/thread": "show the current thread id",
+    "/profile": "show stored user profile",
+    "/help": "list session commands",
+}
+
+
+def print_help():
+    print("\nSession commands:")
+
+    for command, description in SESSION_COMMANDS.items():
+        print(f"  {command:<9} {description}")
+
+    print("  /thread <id>  switch to a specific thread id\n")
+
+
+def stream_answer(graph, messages: list[AnyMessage], config: dict) -> None:
+    """Jalankan graph sambil mencetak token dan aktivitas tool."""
+    # stream_mode="messages" menghasilkan (chunk, metadata) untuk setiap
+    # token dan setiap pesan lengkap dari node.
+    for chunk, metadata in graph.stream(
+        {"messages": messages},
+        config,
+        stream_mode="messages",
+    ):
+        node = metadata.get("langgraph_node", "")
+
+        if isinstance(chunk, ToolMessage):
+            content = str(chunk.content)
+
+            if len(content) > 200:
+                content = content[:200] + "..."
+
+            print(f"\n[Tool result] {content}")
+
+        elif (
+            isinstance(chunk, AIMessageChunk)
+            and node == "llm"
+            and chunk.content
+        ):
+            # Token jawaban dicetak langsung tanpa newline. Tool call tidak
+            # dicetak dari chunk karena argumennya datang secara pecahan;
+            # print_turn_summary membacanya dari state yang sudah lengkap.
+            print(chunk.content, end="", flush=True)
+
+    print()
+
+
+def print_turn_summary(graph, config: RunnableConfig) -> None:
+    """Cetak rute dan tool yang dipakai, dibaca dari state terakhir."""
+    snapshot = graph.get_state(config)
+
+    values = snapshot.values if snapshot else {}
+
+    route = values.get("route", "general")
+    distance = values.get("route_distance", 0.0)
+
+    print(f"[Route: {route} | distance: {distance:.4f}]")
+
+    for message in values.get("messages", [])[-3:]:
+        for call in getattr(message, "tool_calls", None) or []:
+            print(f"[Tool call] {call['name']}{call['args']}")
+
 
 def main():
-    print("\n=== LangGraph Hybrid Agent ===")
-    print("Semantic routing + Tool Calling")
-    print("Routes: coding, ml, general")
-    print("Tools: add, multiply")
-    print("Ketik 'exit' untuk keluar.\n")
+    print("=== LangGraph Hybrid: Conditional Edge + Tool Calling ===")
 
-    # Inisialisasi database long-term memory.
-    init_profile_db()
+    # Vector store dibangun sekali di awal supaya biaya memuat model
+    # embedding tidak masuk ke waktu respons pertanyaan pertama.
+    print(f"Routing samples loaded: {routing_sample_count()}")
 
-    # Fixed user ID for local experimentation.
-    # Distinct from thread_id, which uniquely identifies a conversation session.
-    user_id = "local-user"
+    print(f"Tools available: {', '.join(tool.name for tool in TOOLS)}")
+    print("Ask about coding, ML, or general topics.")
+    print("Type 'exit' to quit. Type '/help' for session commands.\n")
 
-    with SqliteSaver.from_conn_string("checkpoints.sqlite") as checkpointer:
-        graph = builder.compile(checkpointer=checkpointer)
-        
+    # Persistent memory untuk profil user (lintas sesi).
+    profile_memory.init_profile_db()
+
+    # Satu identitas user untuk eksperimen lokal. Beda dengan thread_id:
+    # user_id mengikat long-term memory, thread_id mengikat satu percakapan.
+    user_id = DEFAULT_USER_ID
+
+    def make_config(current_thread_id: str) -> dict:
+        return {
+            "configurable": {
+                "thread_id": current_thread_id,
+                "user_id": user_id,
+            }
+        }
+
+    # Checkpointer untuk riwayat percakapan (per thread).
+    # Nama file sama dengan yang dibaca inspect_checkpoints.py.
+    with SqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+
+        # Satu thread per jalankan program, supaya riwayat tidak tercampur
+        # dengan sesi sebelumnya.
+        thread_id = f"session-{uuid.uuid4()}"
+        config = make_config(thread_id)
+
+        print(f"Thread: {thread_id}\n")
+
         while True:
-            question = input("You: ").strip()
+            user_input = input("You: ").strip()
 
-            if question.lower() in {"exit", "quit"}:
+            if user_input.lower() in {"exit", "quit"}:
                 print("Goodbye!")
                 break
 
-            if not question:
+            if not user_input:
+                continue
+
+            if user_input.startswith("/"):
+                command, *arguments = user_input.split(maxsplit=1)
+                argument = arguments[0] if arguments else ""
+
+                if command in {"/new", "/reset"}:
+                    thread_id = f"session-{uuid.uuid4()}"
+                    config = make_config(thread_id)
+
+                    if command == "/reset":
+                        profile_memory.reset_profile(user_id)
+                        print(f"New thread and profile cleared: {thread_id}\n")
+                    else:
+                        print(f"New thread: {thread_id}\n")
+
+                elif command == "/thread":
+                    if argument:
+                        thread_id = argument
+                        config = make_config(thread_id)
+
+                    print(f"Thread: {thread_id}\n")
+
+                elif command == "/profile":
+                    profile = profile_memory.get_profile(user_id)
+
+                    if profile:
+                        print("\nStored profile:")
+
+                        for key, value in profile.items():
+                            print(f"  {key}: {value}")
+                    else:
+                        print("\nNo profile stored yet.")
+
+                    print()
+
+                elif command == "/help":
+                    print_help()
+
+                else:
+                    print(f"Unknown command: {command}")
+                    print_help()
+
                 continue
 
             try:
-                # 1. Fetch the user's long-term memory profile.
-                profile = get_profile(user_id)
-
-                # 2. Detect simple name introductions.
-                # Examples: "My name is Fajar" or "Nama saya Fajar".
-                match = re.search(
-                    r"^\s*(?:my name is|nama saya|nama aku)\s+"
-                    r"([A-Za-z][A-Za-z '\-]{0,79})\s*[.!]?\s*$",
-                    question,
-                    flags=re.IGNORECASE,
+                # 1. Simpan preferensi permanen yang user nyatakan.
+                outcome = profile_memory.process_profile_preference(
+                    user_id,
+                    user_input,
                 )
 
-                if match:
-                    name = match.group(1).strip().rstrip(".!").strip()
+                for key, value in outcome["detected_updates"].items():
+                    print(f"[Profile Memory] Saved {key}: {value}")
 
-                    if name:
-                        update_profile_name(user_id, name)
-                        profile = get_profile(user_id)
-                        print(
-                            f"[Profile Memory] Name '{name}' "
-                            "successfully saved."
-                        )
+                # 2. Kenali kalimat perkenalan ("nama saya Fajar").
+                name = profile_memory.extract_name_introduction(user_input)
 
-                # 3. Inject profile context into the model prompt.
-                # This context is provided only to the model for this request;
-                # it does not alter the user message saved in the graph state.
-                if profile and profile.get("name"):
-                    memory_context = (
-                        "Long-term user profile:\n"
-                        f"- User's name: {profile['name']}\n"
-                        "Use this profile when relevant to the user's "
-                        "question. Do not claim that the user said this "
-                        "in the current conversation."
-                    )
-                    message = HumanMessage(
-                        content=(
-                            f"{memory_context}\n\n"
-                            f"User's current message:\n{question}"
-                        )
-                    )
-                    print(
-                        f"[Profile Memory] Saved name: "
-                        f"{profile['name']}"
-                    )
-                else:
-                    message = HumanMessage(content=question)
+                if name:
+                    profile_memory.update_profile_name(user_id, name)
+                    print(f"[Profile Memory] Saved name: {name}")
 
-                # 4. Set execution thread configuration.
-                # Changing thread_id creates an isolated state checkpoint.
-                config = {
-                    "configurable": {
-                        "thread_id": "learning-session-3"
-                    }
-                }
-
-                result = graph.invoke(
-                    {
-                        "messages": [message]
-                    },
-                    config=config,
+                stream_answer(
+                    graph,
+                    [HumanMessage(content=user_input)],
+                    config,
                 )
 
-                final_message = result["messages"][-1]
-
-                print(f"\nRoute: {result['route']}")
-                print(f"AI: {final_message.content}\n")
-
-                # 5. Debug metadata IFM
-                for i, message in enumerate(result["messages"]):
-                    if isinstance(message, AIMessage):
-                        print(f"[Debug] Assistant message #{i}")
-                        print(
-                            "[Debug] additional_kwargs keys:",
-                            list(message.additional_kwargs.keys()),
-                        )
-                        print(
-                            "[Debug] reasoning_content present:",
-                            "reasoning_content" in message.additional_kwargs,
-                        )
-                        print(
-                            "[Debug] response_metadata keys:",
-                            list(message.response_metadata.keys()),
-                        )
+                print_turn_summary(graph, config)
+                print()
 
             except Exception as exc:
-                print(f"\nError: {exc}\n")
+                logger.exception("graph invocation failed")
+                print(f"\nAn error occurred: {exc}\n")
 
 
 if __name__ == "__main__":

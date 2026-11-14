@@ -1,0 +1,20 @@
+[project]
+name = "agenticai-langgraph"
+description = "Eksperimen LangGraph: routing semantik, tool calling, dan memori agent"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+markers = [
+    "slow: memuat model embedding lokal, butuh waktu menit",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = [".venv", "__pycache__", ".pytest_cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]

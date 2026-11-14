@@ -1,4 +1,8 @@
 langgraph
+langgraph-checkpoint-sqlite
 langchain-core
 langchain-openai
+langchain-chroma
+langchain-huggingface
+sentence-transformers
 python-dotenv

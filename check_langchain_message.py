@@ -1,8 +1,9 @@
 
-from app import llm
 from langchain_core.messages import HumanMessage
 
-response = llm.invoke([
+from llm import get_llm
+
+response = get_llm().invoke([
     HumanMessage(content="Reply briefly with: hello")
 ])
 
