@@ -75,6 +75,54 @@ cukup menambah satu entri pada dict `PROVIDERS` dan satu variabel API key.
 
 ---
 
+## Mulai cepat
+
+```powershell
+cd D:\Project\AgenticAI_LangGraph
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements-dev.txt
+
+python app.py
+```
+
+Setelah prompt pertama, `app.py` mencetak jawaban model dan keluar ke
+`You:` lagi. Ketik `exit` untuk berhenti.
+
+Kalau aktivasi virtualenv ditolak PowerShell (*"running scripts is disabled on
+this system"* / *about_Execution_Policies*), jangan ubah execution policy —
+pakai interpreter lewat path lengkap, tanpa aktivasi:
+
+```powershell
+.\.venv\Scripts\python.exe app.py
+```
+
+Perintah lain di README ini mengasumsikan virtualenv sudah aktif. Kalau tidak,
+ganti `python` dengan `.\.venv\Scripts\python.exe`.
+
+### Urutan menjalankan
+
+Keempat app berdiri sendiri. Jalankan berurutan kalau kamu sedang mempelajari
+project ini dari awal.
+
+| Perintah | Mulai | Butuh embedding | Yang terlihat |
+| --- | --- | --- | --- |
+| `python app.py` | instan | tidak | satu node, satu jawaban |
+| `python app_tools.py` | instan | tidak | `[Tool call] calculate{...}` sebelum jawaban |
+| `python app_conditional.py` | ±15 detik | ya | diagram mermaid, lalu `Routing: coding` + `distance`/`rescued`/`neighbors` |
+| `python app_hybrid.py` | ±15 detik | ya | streaming token + `[Route: coding \| distance: 0.8411]` + `[Tool call]` + `[Profile Memory]` |
+
+Jeda ±15 detik itu bukan hang: model embedding Qwen3-Embedding-0.6B dimuat ke
+RAM sebelum pertanyaan pertama. Setelah lewat, pertanyaan berikutnya cepat.
+Kalau modelnya belum pernah terunduh, jalankan `python router_eval.py` sekali
+dulu — proses unduh butuh beberapa menit.
+
+`app_hybrid.py` adalah yang paling lengkap; perintah sesinya (`/new`, `/reset`,
+`/thread`, `/profile`, `/help`) dijelaskan di bagian
+[Menjalankan `app_hybrid.py`](#menjalankan-app_hybridpy).
+
+---
+
 ## Arsitektur modul
 
 Aplikasi `app_*.py` sengaja dibuat tipis. Logika yang bisa dipakai ulang
@@ -219,15 +267,143 @@ benar aman bisa lebih pendek dari angkanya. Perilaku ini dikunci oleh
 
 ---
 
+## Uji coba manual
+
+Suite otomatis tidak membuktikan model *memilih* tool yang benar — itu
+keputusan model, bukan kode kita. Bagian ini untuk mengeceknya sendiri lewat
+`python app_hybrid.py`. Semua contoh di bawah sudah dijalankan terhadap API
+sungguhan.
+
+### Tool calling
+
+| Ketik | Yang harus muncul |
+| --- | --- |
+| `berapa 123 kali 45?` | `[Tool call] calculate{'expression': '123 * 45'}` lalu jawaban `5535` |
+| `sekarang jam berapa?` | `[Tool call] current_datetime{}` |
+| `daftar file di folder ini` | `[Tool call] list_project_files{'subdirectory': '.'}` |
+| `baca isi file app.py` | `[Tool call] read_project_file{'relative_path': 'app.py'}` |
+
+`calculate` dipanggil meski model bisa berhitung sendiri — ini yang menguji
+loop `llm -> tools -> llm` benar-benar terjadi, bukan hanya terangkai di graph.
+
+### Penolakan file kredensial
+
+| Ketik | Yang harus muncul |
+| --- | --- |
+| `baca isi file .env saya` | penolakan, **bukan** isi file |
+
+Catatan jujur: pada pengujian, model menolak sendiri tanpa memanggil tool.
+Itu perilaku model, bukan jaminan kode. Yang menjamin `.env` tidak bisa dibaca
+adalah `tools.py` (ditolak sebelum filesystem disentuh), dan itu dikunci oleh
+`test_tools.py` — bukan oleh kesediaan model.
+
+### Routing
+
+Setelah setiap jawaban, `app_hybrid.py` mencetak baris ringkasan. Saat tool
+dipanggil, urutannya begini:
+
+```
+[Tool result] 123 * 45 = 5535
+Hasil dari 123 kali 45 adalah 5535.
+[Route: general | distance: 1.3870]
+[Tool call] calculate{'expression': '123 * 45'}
+```
+
+`[Tool result]` dicetak lebih dulu (saat streaming, sebelum jawaban), sisanya
+setelah jawaban selesai. Apakah keputusan rescue dipakai tidak tercetak di baris
+ringkasan, tapi ada di log router pada level `DEBUG`:
+
+```powershell
+$env:LOG_LEVEL = "DEBUG"
+python app_hybrid.py
+```
+
+```
+2026-01-01 10:00:00 | DEBUG   | app_hybrid | route=coding distance=1.0379 rescued=True neighbors=...
+```
+
+Rute di bawah terverifikasi pada kalibrasi terakhir:
+
+| Ketik | Rute | Jarak |
+| --- | --- | --- |
+| `buatkan class python untuk linked list` | `coding` | 0.84 |
+| `cara menulis unit test di pytest` | `coding` | 0.76 |
+| `apa bedanya retrieval dan fine-tuning` | `ml` | 0.47 |
+| `tips menjaga kesehatan saat bekerja di depan komputer` | `general` | 0.97 |
+| `resep nasi goreng sederhana` | `general` | 1.07 |
+
+Dua contoh yang **melawan intuisi**, dan berguna untuk dipahami:
+
+| Ketik | Rute | Kenapa |
+| --- | --- | --- |
+| `berapa 123 kali 45?` | `general` (jarak 1.39) | jauh dari semua sampel intent, jadi jatuh ke fallback. Jawaban tetap benar karena tool dipilih model, bukan oleh rute. |
+| `kenapa kode saya error TypeError saat iterasi dict` | `coding` lewat **rescue** (`rescued=True`, jarak 1.04) | jaraknya lewat ambang batas 1.02, tapi ketiga tetangga terdekat sepakat `coding`. |
+
+### Memori jangka pendek (satu percakapan)
+
+```
+You: nama saya Fajar
+You: tadi saya bilang nama saya siapa?
+```
+
+Giliran kedua harus menjawab "Fajar". Riwayatnya tersimpan di
+`checkpoints.sqlite`; lihat dengan `python inspect_checkpoints.py`. Setelah
+`/new`, pertanyaan yang sama tidak akan terjawab — itu memang bedanya thread
+baru.
+
+### Memori jangka panjang (lintas sesi)
+
+```
+You: nama saya Fajar
+You: mulai sekarang jawab dalam bahasa Inggris
+You: /profile
+```
+
+`/profile` menampilkan `name: Fajar` dan `preferred_language: English`.
+Profil ini **tetap ada** setelah `/new` dan setelah program ditutup lalu
+dijalankan lagi. Untuk menghapusnya: `/reset`.
+
+Bandingkan dengan instruksi sementara:
+
+```
+You: untuk kali ini saja jawab dalam bahasa Inggris
+You: sekarang jawab dengan bahasa yang biasa kamu pakai
+```
+
+Yang kedua kembali ke bahasa biasa, karena override-nya hanya berlaku satu
+giliran dan tidak masuk profil.
+
+### Kalau hasilnya berbeda dari tabel di atas
+
+Routing bergantung pada model embedding, jadi angkanya bisa bergeser kalau
+kamu mengganti `EMBEDDING_DEVICE` atau versi `sentence-transformers`. Cek
+apakah kalibrasi masih berlaku:
+
+```powershell
+python router_eval.py
+```
+
+Kalau akurasi turun di bawah target, lihat
+[Router semantik](#router-semantik) untuk cara mengkalibrasi ulang.
+
+---
+
 ## Test
+
+```powershell
+pytest -m "not slow"
+```
+
+**81 test** dengan perintah di atas, semuanya offline: tidak ada satu pun yang
+memanggil API. [`conftest.py`](conftest.py) menanam API key dummy sebelum modul
+proyek diimpor, jadi test berjalan tanpa `.env` yang benar dan tanpa biaya API.
 
 ```powershell
 pytest
 ```
 
-81 test, semuanya offline: tidak ada satu pun yang memanggil API.
-[`conftest.py`](conftest.py) menanam API key dummy sebelum modul proyek
-diimpor, jadi test berjalan tanpa `.env` yang benar dan tanpa biaya API.
+**85 test** — 4 sisanya (`-m slow`) memuat model embedding sehingga butuh
+±2 menit pada run pertama.
 
 | File | Mencakup |
 | --- | --- |
