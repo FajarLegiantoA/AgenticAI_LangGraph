@@ -5,27 +5,17 @@ Run with: pytest test_profile_preferences.py
 
 import pytest
 
-import profile_memory
 from profile_memory import (
     detect_profile_preference,
     detect_temporary_instructions,
     get_profile,
-    init_profile_db,
     process_profile_preference,
     update_profile,
     update_profile_name,
 )
 
-
-@pytest.fixture(autouse=True)
-def isolated_profile_db(tmp_path, monkeypatch):
-    """Point the module at a throwaway SQLite file for every test."""
-    monkeypatch.setattr(
-        profile_memory,
-        "DB_PATH",
-        tmp_path / "profile_memory_test.sqlite",
-    )
-    init_profile_db()
+# Fixture `isolated_profile_db` datang dari conftest.py dan bersifat autouse,
+# jadi setiap test di file ini otomatis memakai database profil sementara.
 
 
 def test_update_profile_persists_all_fields():

@@ -64,6 +64,10 @@ MODEL_MAX_TOKENS=512
 MODEL_TIMEOUT=60
 MODEL_MAX_RETRIES=2
 LOG_LEVEL=INFO
+
+# Opsional: batas riwayat yang dikirim ke model (lihat "Memori")
+MAX_CONTEXT_TOKENS=2048
+MAX_RECENT_MESSAGES=12
 ```
 
 Provider didefinisikan di [`config.py`](config.py). Menambah provider baru
@@ -194,9 +198,20 @@ Dua jenis memori yang bekerja bersamaan:
 `thread_id` dan `user_id` sengaja dipisah: satu orang bisa punya banyak
 percakapan, dan satu percakapan tetap milik orang yang sama.
 
-Konteks yang dikirim ke model dipotong otomatis (`MAX_CONTEXT_TOKENS`,
-`MAX_RECENT_MESSAGES`). Pemotongan hanya memengaruhi apa yang dilihat model —
-riwayat lengkap tetap utuh di checkpointer.
+Konteks yang dikirim ke model dipotong otomatis lewat dua batas yang bisa
+diatur dari `.env`: `MAX_RECENT_MESSAGES` (jumlah pesan) lalu
+`MAX_CONTEXT_TOKENS` (jumlah token). Pemotongan hanya memengaruhi apa yang
+dilihat model — riwayat lengkap tetap utuh di checkpointer.
+
+Urutannya penting dan disengaja: batas jumlah pesan diterapkan **lebih dulu**,
+baru `trim_messages` dengan `start_on="human"`. Kalau dibalik, pemotongan
+jumlah akan mengabaikan `start_on` dan jendela riwayat bisa dimulai dari
+tengah giliran — termasuk diawali `ToolMessage` tanpa `AIMessage(tool_calls)`
+pendahulunya, kondisi yang ditolak API. Akibat dari urutan yang benar:
+`MAX_RECENT_MESSAGES` adalah batas atas, bukan jaminan jumlah pesan. Sisa
+potongan yang berada di tengah giliran ikut dibuang, jadi jendela yang benar-
+benar aman bisa lebih pendek dari angkanya. Perilaku ini dikunci oleh
+`test_context_trimming.py`.
 
 ---
 
@@ -206,12 +221,16 @@ riwayat lengkap tetap utuh di checkpointer.
 pytest
 ```
 
-53 test, tanpa perlu API key.
+76 test, semuanya offline: tidak ada satu pun yang memanggil API.
+[`conftest.py`](conftest.py) menanam API key dummy sebelum modul proyek
+diimpor, jadi test berjalan tanpa `.env` yang benar dan tanpa biaya API.
 
 | File | Mencakup |
 | --- | --- |
 | `test_profile_preferences.py` | Deteksi preferensi permanen vs instruksi sementara. |
 | `test_tools.py` | Kalkulator menolak kode arbitrer, file kredensial terblokir, path traversal terblokir. |
+| `test_context_trimming.py` | Pemotongan konteks: batas token, batas jumlah pesan, dan jaminan jendela selalu mulai dari giliran user. |
+| `test_graph.py` | Graph yang sudah di-compile dijalankan beneran dengan model berskrip: loop tool, error tool, checkpointer, dan pemisahan thread. |
 | `test_router_eval.py` | Akurasi router pada dataset DEV dan HELDOUT, plus smoke test node router di aplikasi. |
 
 `test_router_eval.py` memuat model embedding sehingga butuh ±2 menit pada run
@@ -220,6 +239,22 @@ pertama. Untuk melewatinya saat sedang cepat-cepat:
 ```powershell
 pytest -m "not slow"
 ```
+
+`test_graph.py` memakai `FakeMessagesListChatModel` dari `langchain_core` yang
+di-subclass supaya `bind_tools` tidak melempar `NotImplementedError`. Routing
+semantik di-stub di sana karena sudah diuji terpisah di `test_router_eval.py`.
+
+---
+
+## Continuous integration
+
+[`ci.yml`](.github/workflows/ci.yml) menjalankan `ruff check .` dan
+`pytest -m "not slow"` pada Python 3.10 dan 3.12 setiap push dan pull request.
+Workflow ini tidak butuh secret apa pun, karena suite-nya offline.
+
+Evaluasi router (`python router_eval.py`) tidak ikut di setiap push karena
+memuat model embedding ±1 GB. Jalankan manual lewat tab **Actions →
+Run workflow** kalau kamu mengubah `ROUTING_SAMPLES` atau ambang batas jarak.
 
 ---
 
@@ -239,6 +274,11 @@ pytest -m "not slow"
   LangChain membuang field itu pada respons streaming. `IFMChatOpenAI`
   memulihkannya lewat `_convert_chunk_to_generation_chunk`. Kalau kamu
   mengganti provider, adapter ini tidak diperlukan.
+* **Ekstraksi bahasa hanya mengenal dua bahasa.** `LANGUAGE_PATTERNS` di
+  `profile_memory.py` hanya punya pola untuk English dan Indonesian. Kalimat
+  seperti "untuk kali ini saja jawab dalam bahasa Jepang" lolos dari deteksi,
+  jadi override sementara tidak terjadi. Menambah bahasa berarti menambah
+  pasangan pola `strict`/`loose` baru, bukan mengubah logikanya.
 * **Embedding berjalan di CPU** dan butuh ±15 detik saat dimuat. Set
   `EMBEDDING_DEVICE=cuda` kalau tersedia.
 
@@ -248,6 +288,5 @@ pytest -m "not slow"
 
 * `checkpoints.sqlite`, `profile_memory.sqlite`, dan `.env` tidak di-commit.
 * Skrip `check_*.py` dan `inspect_checkpoints.py` adalah alat inspeksi, bukan
-  bagian dari aplikasi.
-* `test_ifm_multiturn.py` memanggil API sungguhan, jadi butuh API key dan tidak
-  ikut dalam test suite.
+  bagian dari aplikasi. `check_ifm_multiturn.py` memanggil API sungguhan, jadi
+  butuh API key dan tidak ikut dalam test suite.

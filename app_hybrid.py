@@ -45,6 +45,7 @@ from langgraph.graph.message import MessagesState
 from langgraph.prebuilt import ToolNode
 
 import profile_memory
+from config import get_context_settings
 from llm import get_llm
 from log import get_logger
 from router import routing_sample_count, semantic_route
@@ -62,10 +63,9 @@ def get_llm_with_tools():
     """
     return get_llm().bind_tools(TOOLS)
 
-# Batas konteks yang dikirim ke model. Ini hanya membatasi apa yang dilihat
+# Batas konteks dibaca dari konfigurasi (lihat config.get_context_settings),
+# supaya bisa diubah lewat .env. Pemotongan hanya memengaruhi apa yang dilihat
 # model; riwayat lengkap tetap tersimpan di checkpointer.
-MAX_CONTEXT_TOKENS = 2048
-MAX_RECENT_MESSAGES = 12
 
 # user_id mengidentifikasi orang (long-term memory, lintas sesi).
 # thread_id mengidentifikasi satu percakapan (short-term memory).
@@ -160,13 +160,31 @@ def router_node(state: AgentState):
     }
 
 
-def build_model_messages(state: AgentState, user_id: str) -> list[AnyMessage]:
+def build_model_messages(
+    state: AgentState,
+    user_id: str,
+    *,
+    max_tokens: int | None = None,
+    max_messages: int | None = None,
+) -> list[AnyMessage]:
     """Susun pesan untuk model: system prompt + riwayat yang dipotong.
 
     Pemotongan hanya memengaruhi apa yang dikirim ke model. State graph
     (dan dengan itu riwayat di checkpointer) tidak diubah, sehingga user
     tetap bisa melihat percakapan penuh.
+
+    Args:
+        max_tokens: Batas token untuk riwayat. Default dari konfigurasi.
+        max_messages: Batas jumlah pesan. Default dari konfigurasi.
     """
+    limits = get_context_settings()
+
+    if max_tokens is None:
+        max_tokens = limits.max_tokens
+
+    if max_messages is None:
+        max_messages = limits.max_messages
+
     messages: list[AnyMessage] = list(state["messages"])
 
     if not messages:
@@ -189,25 +207,31 @@ def build_model_messages(state: AgentState, user_id: str) -> list[AnyMessage]:
         overrides = ", ".join(f"{k}: {v}" for k, v in temporary.items())
         system_prompt += f"\n\nFor this response only: {overrides}."
 
+    # Batas keras pertama: jumlah pesan. Dipotong sebelum trim_messages,
+    # bukan sesudah, supaya aturan start_on di bawah tetap berlaku atas hasil
+    # akhir. Kalau urutannya dibalik, slice ini bisa membuat jendela dimulai
+    # dari tengah giliran (misalnya AIMessage berisi tool_calls) karena slice
+    # tidak mengenal start_on.
+    candidates = (
+        messages[-max_messages:] if max_messages > 0 else list(messages)
+    )
+
     # strategy="last" menyimpan pesan-pesan terbaru. start_on="human"
     # menjamin hasil potongan dimulai dari awal giliran user, sehingga tidak
     # pernah menyisakan ToolMessage tanpa AIMessage tool_calls pendahulunya
     # (kondisi yang ditolak API). end_on sengaja tidak dipakai: pesan terakhir
     # justru HumanMessage baru yang akan dijawab.
-    trimmed = trim_messages(
-        messages,
-        max_tokens=MAX_CONTEXT_TOKENS,
-        token_counter=count_tokens_approximately,
-        strategy="last",
-        start_on="human",
-        allow_partial=False,
-    )
-
-    # Batas keras kedua: jumlah pesan, supaya percakapan pendek pun tidak
-    # pernah membawa seluruh riwayat.
-    trimmed = trimmed[-MAX_RECENT_MESSAGES:]
-
-    return [SystemMessage(content=system_prompt), *trimmed]
+    return [
+        SystemMessage(content=system_prompt),
+        *trim_messages(
+            candidates,
+            max_tokens=max_tokens,
+            token_counter=count_tokens_approximately,
+            strategy="last",
+            start_on="human",
+            allow_partial=False,
+        ),
+    ]
 
 
 def llm_node(state: AgentState, config: RunnableConfig):
@@ -456,4 +480,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        # stdin ditutup (mis. output pipa habis) atau Ctrl+C: keluar diam-diam
+        # supaya tidak menampilkan traceback yang tidak berguna. Checkpointer
+        # sudah tertutup oleh context manager di dalam main().
+        print("\nGoodbye!")

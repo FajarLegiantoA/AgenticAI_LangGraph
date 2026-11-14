@@ -41,6 +41,14 @@ PROVIDERS: dict[str, dict[str, str]] = {
 
 
 @dataclass(frozen=True)
+class ContextSettings:
+    """Batas konteks yang dikirim ke model pada satu panggilan."""
+
+    max_tokens: int
+    max_messages: int
+
+
+@dataclass(frozen=True)
 class LLMSettings:
     """Hasil resolusi provider + model yang akan dipakai."""
 
@@ -101,4 +109,17 @@ def get_llm_settings() -> LLMSettings:
         max_tokens=_env_int("MODEL_MAX_TOKENS", 512),
         timeout=_env_int("MODEL_TIMEOUT", 60),
         max_retries=_env_int("MODEL_MAX_RETRIES", 2),
+    )
+
+
+def get_context_settings() -> ContextSettings:
+    """Batas riwayat yang dikirim ke model.
+
+    Ini hanya membatasi apa yang dilihat model pada satu giliran. Riwayat
+    lengkap tetap tersimpan di checkpointer, jadi memotong konteks tidak
+    menghapus percakapan.
+    """
+    return ContextSettings(
+        max_tokens=_env_int("MAX_CONTEXT_TOKENS", 2048),
+        max_messages=_env_int("MAX_RECENT_MESSAGES", 12),
     )

@@ -82,4 +82,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        # stdin ditutup (mis. output pipa habis) atau Ctrl+C: keluar diam-diam
+        # supaya tidak menampilkan traceback yang tidak berguna.
+        print("\nSee you later!")
