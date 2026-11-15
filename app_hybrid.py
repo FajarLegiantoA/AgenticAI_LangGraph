@@ -46,6 +46,7 @@ from langgraph.prebuilt import ToolNode
 
 import profile_memory
 from config import get_context_settings
+from data_paths import data_path
 from llm import get_llm
 from log import get_logger
 from router import routing_sample_count, semantic_route
@@ -71,7 +72,14 @@ def get_llm_with_tools():
 # thread_id mengidentifikasi satu percakapan (short-term memory).
 DEFAULT_USER_ID = "local-user"
 
-CHECKPOINT_DB = "checkpoints.sqlite"
+def checkpoint_db_path() -> str:
+    """Lokasi ``checkpoints.sqlite``.
+
+    Default: folder proyek (perilaku CLI lama). ``DATA_DIR`` memindahkannya —
+    inilah yang dipakai ``api_server.py`` dan compose supaya kedua aplikasi
+    menunjuk ke file yang sama di dalam volume container.
+    """
+    return str(data_path("checkpoints.sqlite"))
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +365,38 @@ def print_turn_summary(graph, config: RunnableConfig) -> None:
             print(f"[Tool call] {call['name']}{call['args']}")
 
 
+def prepare_turn(user_id: str, user_input: str) -> dict:
+    """Catat long-term memory dari satu pesan user sebelum graph jalan.
+
+    Dipecah dari :func:`main` supaya CLI dan ``api_server.py`` memakai logika
+    deteksi yang persis sama:
+
+    1. Preferensi permanen ("mulai sekarang ...") -> disimpan ke profil.
+    2. Kalimat perkenalan ("nama saya Fajar")     -> nama tersimpan.
+
+    Return instruksi yang tersimpan (dict, kosong kalau tidak ada) supaya
+    pemanggil bisa menampilkannya ke user. Pemanggil tetap wajib memanggil
+    ``profile_memory.init_profile_db()`` sekali sebelum fungsi ini.
+    """
+    outcome = profile_memory.process_profile_preference(user_id, user_input)
+
+    for key, value in outcome["detected_updates"].items():
+        print(f"[Profile Memory] Saved {key}: {value}")
+
+    name = profile_memory.extract_name_introduction(user_input)
+
+    if name:
+        profile_memory.update_profile_name(user_id, name)
+        print(f"[Profile Memory] Saved name: {name}")
+
+    # Nama ikut dilaporkan supaya API bisa menampilkannya seperti CLI.
+    saved = dict(outcome["detected_updates"])
+
+    if name:
+        saved["name"] = name
+    return saved
+
+
 def main():
     print("=== LangGraph Hybrid: Conditional Edge + Tool Calling ===")
 
@@ -385,7 +425,7 @@ def main():
 
     # Checkpointer untuk riwayat percakapan (per thread).
     # Nama file sama dengan yang dibaca inspect_checkpoints.py.
-    with SqliteSaver.from_conn_string(CHECKPOINT_DB) as checkpointer:
+    with SqliteSaver.from_conn_string(checkpoint_db_path()) as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
 
         # Satu thread per jalankan program, supaya riwayat tidak tercampur
@@ -449,21 +489,9 @@ def main():
                 continue
 
             try:
-                # 1. Simpan preferensi permanen yang user nyatakan.
-                outcome = profile_memory.process_profile_preference(
-                    user_id,
-                    user_input,
-                )
-
-                for key, value in outcome["detected_updates"].items():
-                    print(f"[Profile Memory] Saved {key}: {value}")
-
-                # 2. Kenali kalimat perkenalan ("nama saya Fajar").
-                name = profile_memory.extract_name_introduction(user_input)
-
-                if name:
-                    profile_memory.update_profile_name(user_id, name)
-                    print(f"[Profile Memory] Saved name: {name}")
+                # Preferensi permanen + perkenalan nama -> long-term memory.
+                # Fungsinya dipakai bersama dengan api_server.py.
+                prepare_turn(user_id, user_input)
 
                 stream_answer(
                     graph,

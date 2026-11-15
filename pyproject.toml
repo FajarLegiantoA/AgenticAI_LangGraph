@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]
+addopts = ["-m", "not slow"]
 markers = [
     "slow: memuat model embedding lokal, butuh waktu menit",
 ]

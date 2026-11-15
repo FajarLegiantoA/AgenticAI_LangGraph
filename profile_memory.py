@@ -23,7 +23,12 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / "profile_memory.sqlite"
+from data_paths import data_path
+
+# Ikut ``DATA_DIR`` (lihat data_paths) supaya profil dan checkpointer bisa
+# dipindah ke satu volume tanpa mengubah kode. Tanpa env itu, nilainya tetap
+# folder proyek — perilaku lama, dan dasar bagi fixture test.
+DB_PATH: Path = data_path("profile_memory.sqlite")
 
 
 # =========================================================

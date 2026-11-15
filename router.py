@@ -127,6 +127,16 @@ ROUTING_SAMPLES: tuple[tuple[str, str], ...] = (
         "coding",
     ),
     (
+        "Implement sorting algorithms such as merge sort, quicksort, "
+        "or heapsort in Go, Python, Java, C++, or JavaScript.",
+        "coding",
+    ),
+    (
+        "Write a complete implementation of an algorithm in a programming "
+        "language, including its functions, logic, and tests.",
+        "coding",
+    ),
+    (
         "Build a helper function that parses, formats, or validates "
         "user input.",
         "coding",
@@ -209,6 +219,17 @@ ROUTING_SAMPLES: tuple[tuple[str, str], ...] = (
     ),
     (
         "History of computer hardware, CPUs, and operating systems.",
+        "general",
+    ),
+    # ---------------- non-technical fallback examples ----------------
+    (
+        "Answer everyday non-technical questions about cooking, travel, "
+        "household tasks, vehicle maintenance, and daily life.",
+        "general",
+    ),
+    (
+        "Jawab pertanyaan sehari-hari non-teknis tentang memasak, "
+        "perjalanan, pekerjaan rumah, dan perawatan kendaraan.",
         "general",
     ),
 )
